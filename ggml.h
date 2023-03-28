@@ -283,7 +283,8 @@ struct ggml_tensor {
     int64_t perf_time_us;
 
     void * data;
-    char padding[8];
+    int tensor_id;
+    char padding[4];
 };
 
 // computation graph
@@ -312,10 +313,13 @@ struct ggml_scratch {
     void * data;
 };
 
+typedef void (*ggml_perf_mult_func)(void * user_pointer, struct ggml_tensor *, struct ggml_tensor *);
 struct ggml_init_params {
     // memory pool
     size_t mem_size;   // bytes
     void * mem_buffer; // if NULL, memory will be allocated internally
+    ggml_perf_mult_func perf_mult_func; // called when one tensor is multiplied by another
+    void * perf_mult_func_user_pointer;
 };
 
 void    ggml_time_init(void); // call this once at the beginning of the program

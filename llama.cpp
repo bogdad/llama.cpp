@@ -3,6 +3,7 @@
 #include "ggml.h"
 
 #include <cinttypes>
+#include <cstdio>
 #include <fstream>
 #include <random>
 #include <map>
@@ -512,8 +513,10 @@ static bool llama_model_load(
         lctx.model.buf.resize(ctx_size);
 
         struct ggml_init_params params = {
-            /*.mem_size   =*/ lctx.model.buf.size(),
-            /*.mem_buffer =*/ lctx.model.buf.data(),
+            /*.mem_size                    =*/ lctx.model.buf.size(),
+            /*.mem_buffer                  =*/ lctx.model.buf.data(),
+            /*.perf_mult_func              =*/ NULL,
+            /*.perf_mult_func_user_pointer =*/ NULL,
         };
 
         model.ctx = ggml_init(params);
@@ -819,6 +822,11 @@ static bool llama_model_load(
 //   - n_past:    the context size so far
 //   - n_threads: number of threads to use
 //
+
+struct perf_user_data {
+    std::FILE * f_perf;
+};
+
 static bool llama_eval_internal(
         llama_context & lctx,
     const llama_token * tokens,
@@ -846,9 +854,21 @@ static bool llama_eval_internal(
     auto & mem_per_token = lctx.mem_per_token;
     auto & buf_compute   = lctx.buf_compute;
 
+    auto f_perf = std::fopen("./mult.log.csv", "w");
+    perf_user_data p_data {
+        f_perf
+    };
+    auto lama_perf_func = [](void * user_pointer, struct ggml_tensor * p1, struct ggml_tensor * p2)
+    {
+        auto * user_data = (perf_user_data *) user_pointer;
+        fprintf(user_data->f_perf, "%d,%zu,%d,%zu\n", p1->tensor_id, ggml_nbytes(p1), p2->tensor_id, ggml_nbytes(p2));
+    };
+
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute.size(),
-        /*.mem_buffer =*/ buf_compute.data(),
+        /*.mem_size      =*/ buf_compute.size(),
+        /*.mem_buffer    =*/ buf_compute.data(),
+        /*.mem_perf_func =*/ lama_perf_func,
+        /*.mem_perf_func_user_pointer =*/ &p_data,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -1079,7 +1099,7 @@ static bool llama_eval_internal(
         lctx.t_p_eval_us += ggml_time_us() - t_start_us;
         lctx.n_p_eval += N;
     }
-
+    std::fclose(f_perf);
     return true;
 }
 

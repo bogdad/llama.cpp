@@ -2363,6 +2363,9 @@ struct ggml_context {
 
     struct ggml_scratch scratch;
     struct ggml_scratch scratch_save;
+
+    ggml_perf_mult_func perf_mult_func;
+    void * perf_mult_func_user_pointer;
 };
 
 struct ggml_context_container {
@@ -2634,15 +2637,17 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
     }
 
     *ctx = (struct ggml_context) {
-        /*.mem_size           =*/ params.mem_size,
-        /*.mem_buffer         =*/ params.mem_buffer ? params.mem_buffer : malloc(params.mem_size),
-        /*.mem_buffer_owned   =*/ params.mem_buffer ? false : true,
-        /*.mem_buffer_mlocked =*/ false,
-        /*.n_objects          =*/ 0,
-        /*.objects_begin      =*/ NULL,
-        /*.objects_end        =*/ NULL,
-        /*.scratch            =*/ { 0, 0, NULL, },
-        /*.scratch_save       =*/ { 0, 0, NULL, },
+        /*.mem_size               =*/ params.mem_size,
+        /*.mem_buffer             =*/ params.mem_buffer ? params.mem_buffer : malloc(params.mem_size),
+        /*.mem_buffer_owned       =*/ params.mem_buffer ? false : true,
+        /*.mem_buffer_mlocked     =*/ false,
+        /*.n_objects              =*/ 0,
+        /*.objects_begin          =*/ NULL,
+        /*.objects_end            =*/ NULL,
+        /*.scratch                =*/ { 0, 0, NULL, },
+        /*.scratch_save           =*/ { 0, 0, NULL, },
+        /*.perf_mult_func         =*/ params.perf_mult_func,
+        /*.perf_mult_user_pointer =*/ params.perf_mult_func_user_pointer,
     };
 
     GGML_ASSERT(ctx->mem_buffer != NULL); // check for allocation failure
@@ -2745,6 +2750,8 @@ struct ggml_tensor * ggml_new_tensor_impl(
         const int* ne,
         void*  data) {
     // always insert objects at the end of the context's memory pool
+    int new_tensor_id = ctx->n_objects++;
+
     struct ggml_object * obj_cur = ctx->objects_end;
 
     const size_t cur_offs = obj_cur == NULL ? 0 : obj_cur->offs;
@@ -2838,7 +2845,8 @@ struct ggml_tensor * ggml_new_tensor_impl(
         /*.perf_cycles  =*/ 0,
         /*.perf_time_us =*/ 0,
         /*.data         =*/ data == NULL ? (void *)(result + 1) : data,
-        /*.pad          =*/ { 0 },
+        /*.tensor_id    =*/ new_tensor_id,
+        /*.pad          =*/ {0},
     };
 
     ggml_assert_aligned(result->data);
@@ -9136,6 +9144,10 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                         //node->n_tasks = MIN(n_threads, MAX(1, nr0/128));
                         //printf("nr0 = %8d, nr1 = %8d, nr0*nr1 = %8d, n_tasks = %d\n", nr0, nr1, nr0*nr1, node->n_tasks);
 
+                        if (ctx->perf_mult_func != NULL) {
+                            ctx->perf_mult_func(ctx->perf_mult_func_user_pointer, node->src0, node->src1);
+                        }
+
                         size_t cur = 0;
 
                         if (node->src0->type == GGML_TYPE_F16 &&
@@ -10300,6 +10312,8 @@ enum ggml_opt_result ggml_opt(
         struct ggml_init_params params_ctx = {
             .mem_size   = 16*1024*1024,
             .mem_buffer = NULL,
+            .perf_mult_func = NULL,
+            .perf_mult_func_user_pointer = NULL,
         };
 
         ctx = ggml_init(params_ctx);
