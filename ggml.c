@@ -49,6 +49,9 @@ static LONG atomic_fetch_add(atomic_int* ptr, LONG inc) {
 static LONG atomic_fetch_sub(atomic_int* ptr, LONG dec) {
     return atomic_fetch_add(ptr, -(dec));
 }
+static LONG atomic_compare_exchange_strong(atomic_int* ptr, LONG old, LONG new) {
+    return InterlockedCompareExchange(ptr, old, new);
+}
 
 typedef HANDLE pthread_t;
 
@@ -8927,6 +8930,66 @@ struct ggml_cgraph ggml_build_backward(struct ggml_context * ctx, struct ggml_cg
 // I tried using spin locks, but not sure how to use them correctly - the things I tried were slower than busy loops
 //
 
+void ggml_naked_short_sleep(long ms) {
+    // https://github.com/AdoptOpenJDK/openjdk-jdk11/blob/master/src/hotspot/os/bsd/os_bsd.cpp#L2322
+    // makes sense to platformize
+    struct timespec req;
+
+    //assert(ms < 1000, "Un-interruptable sleep, short time use only");
+    req.tv_sec = 0;
+    if (ms > 0) {
+    req.tv_nsec = (ms % 1000) * 1000000;
+    } else {
+    req.tv_nsec = 1;
+    }
+
+    nanosleep(&req, NULL);
+
+    return;
+}
+
+void ggml_naked_yield() {
+    // https://github.com/AdoptOpenJDK/openjdk-jdk11/blob/master/src/hotspot/os/bsd/os_bsd.cpp#L2350
+    // make sense to platformize
+    sched_yield();
+}
+
+int ggml_spin_pause() {
+    //
+    return 0;
+}
+
+void ggml_spin_acquire(atomic_int * addr) {
+    // https://github.com/AdoptOpenJDK/openjdk-jdk11/blob/19fb8f93c59dfd791f62d41f332db9e306bc1422/src/hotspot/share/runtime/thread.cpp#L4711
+    if (atomic_compare_exchange_strong(addr, 1, 0) == 0) {
+        return;   // normal fast-path return
+    }
+
+    // Slow-path : We've encountered contention -- Spin/Yield/Block strategy.
+    int ctr = 0;
+    int Yields = 0;
+    for (;;) {
+        while (*addr != 0) {
+          ++ctr;
+          if ((ctr & 0xFFF) == 0 /*|| !os::is_MP() */) {
+            if (Yields > 5) {
+              ggml_naked_short_sleep(1);
+            } else {
+              ggml_naked_yield();
+              ++Yields;
+            }
+          } else {
+            ggml_spin_pause();
+          }
+        }
+        if (atomic_compare_exchange_strong(addr, 1, 0)) return;
+    }
+}
+
+void ggml_spin_release(atomic_int * addr) {
+    atomic_store(addr, 0);
+}
+
 #ifdef __APPLE__
 
 //#include <os/lock.h>
@@ -8944,8 +9007,8 @@ typedef int ggml_lock_t;
 
 #define ggml_lock_init(x)    UNUSED(x)
 #define ggml_lock_destroy(x) UNUSED(x)
-#define ggml_lock_lock(x)    UNUSED(x)
-#define ggml_lock_unlock(x)  UNUSED(x)
+#define ggml_lock_lock(x)    ggml_spin_acquire(x)
+#define ggml_lock_unlock(x)  ggml_spin_release(x)
 
 #define GGML_LOCK_INITIALIZER 0
 
