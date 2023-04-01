@@ -72,6 +72,59 @@ static int sched_yield (void) {
     Sleep (0);
     return 0;
 }
+
+typedef struct pthread_mutex_tag {
+    CRITICAL_SECTION critical_section;
+} pthread_mutex_t;
+
+typedef struct pthread_mutexattr_tag {
+    int attr;
+} pthread_mutexattr_t;
+
+int pthread_mutex_init(pthread_mutex_t * mutex, const pthread_mutexattr_t * attr) {
+    InitializeCriticalSection (&mutex->critical_section);
+    return 0;
+}
+
+int pthread_mutex_destroy(pthread_mutex_t * mutex) {
+    DeleteCriticalSection(&mutex->critical_section);
+    return 0;
+}
+
+
+int pthread_mutex_lock(pthread_mutex_t * mutex) {
+    EnterCriticalSection(&mutex->critical_section);
+    return 0;
+}
+
+int pthread_mutex_unlock(pthread_mutex_t * mutex) {
+    LeaveCriticalSection(&mutex->critical_section);
+    return 0;
+}
+
+typedef struct pthread_cond_tag {
+    CONDITION_VARIABLE cond;
+} pthread_cond_t;
+
+int pthread_cond_init(pthread_cond_t * cond, void * unused) {
+    InitializeConditionVariable (&cond->cond);
+    return 0;
+}
+
+int pthread_cond_destroy(pthread_cond_t * cond) {
+    return 0;
+}
+
+int pthread_cond_wait(pthread_cond_t * cond, pthread_mutex_t * mutex) {
+    SleepConditionVariableCS(&cond->cond, &mutex->critical_section, INFINITE);
+    return 0;
+}
+
+int pthread_cond_broadcast(pthread_cond_t * cond) {
+    WakeAllConditionVariable(&cond->cond);
+    return 0;
+}
+
 #else
 #include <pthread.h>
 #include <stdatomic.h>
