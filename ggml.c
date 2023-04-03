@@ -9187,6 +9187,49 @@ struct ggml_compute_state {
     struct ggml_compute_state_shared * shared;
 };
 
+void ggml_spin_lock_n_ready_ne(struct ggml_compute_state_shared * state_shared) {
+    while (atomic_load(&state_shared->n_ready) != 0) {
+        ggml_lock_lock  (&state_shared->spin);
+        ggml_lock_unlock(&state_shared->spin);
+    }
+}
+
+void ggml_spin_lock_n_ready(struct ggml_compute_state_shared * state_shared) {
+    while (atomic_load(&state_shared->n_ready) > 0) {
+        ggml_lock_lock  (&state_shared->spin);
+        ggml_lock_unlock(&state_shared->spin);
+    }
+}
+
+void ggml_spin_lock_has_work(struct ggml_compute_state_shared * state_shared) {
+    while (atomic_load(&state_shared->has_work)) {
+        ggml_lock_lock  (&state_shared->spin);
+        ggml_lock_unlock(&state_shared->spin);
+    }
+}
+
+bool ggml_spin_lock_has_work_stop(struct ggml_compute_state_shared * state_shared) {
+    while (atomic_load(&state_shared->has_work)) {
+        if (atomic_load(&state_shared->stop)) {
+            return true;
+        }
+        ggml_lock_lock  (&state_shared->spin);
+        ggml_lock_unlock(&state_shared->spin);
+    }
+    return false;
+}
+
+bool ggml_spin_lock_ne_has_work_stop(struct ggml_compute_state_shared * state_shared) {
+    while (!atomic_load(&state_shared->has_work)) {
+        if (atomic_load(&state_shared->stop)) {
+            return true;
+        }
+        ggml_lock_lock  (&state_shared->spin);
+        ggml_lock_unlock(&state_shared->spin);
+    }
+    return false;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -9196,24 +9239,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (atomic_fetch_add(&state->shared->n_ready, 1) == n_threads - 1) {
             atomic_store(&state->shared->has_work, false);
         } else {
-            while (atomic_load(&state->shared->has_work)) {
-                if (atomic_load(&state->shared->stop)) {
-                    return 0;
-                }
-                ggml_lock_lock  (&state->shared->spin);
-                ggml_lock_unlock(&state->shared->spin);
+            if (ggml_spin_lock_has_work_stop(state->shared)) {
+                return 0;
             }
         }
 
         atomic_fetch_sub(&state->shared->n_ready, 1);
 
         // wait for work
-        while (!atomic_load(&state->shared->has_work)) {
-            if (atomic_load(&state->shared->stop)) {
-                return 0;
-            }
-            ggml_lock_lock  (&state->shared->spin);
-            ggml_lock_unlock(&state->shared->spin);
+        if (ggml_spin_lock_ne_has_work_stop(state->shared)) {
+            return 0;
         }
 
         // check if we should stop
@@ -9234,6 +9269,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     return 0;
 }
+
+
+
 
 void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) {
     const int n_threads = cgraph->n_threads;
@@ -9511,10 +9549,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 atomic_store(&state_shared.has_work, false);
             }
 
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
+            ggml_spin_lock_has_work(&state_shared);
 
             // launch thread pool
             for (int j = 0; j < n_threads - 1; j++) {
@@ -9530,10 +9565,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
 
             atomic_fetch_sub(&state_shared.n_ready, 1);
 
-            while (atomic_load(&state_shared.n_ready) > 0) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
+            ggml_spin_lock_n_ready(&state_shared);
 
             atomic_store(&state_shared.has_work, true);
         }
@@ -9547,17 +9579,11 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 atomic_store(&state_shared.has_work, false);
             }
 
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
+            ggml_spin_lock_has_work(&state_shared);
 
             atomic_fetch_sub(&state_shared.n_ready, 1);
 
-            while (atomic_load(&state_shared.n_ready) != 0) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
+            ggml_spin_lock_n_ready_ne(&state_shared);
         }
 
         // FINALIZE
@@ -9566,10 +9592,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 atomic_store(&state_shared.has_work, false);
             }
 
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
+            ggml_spin_lock_has_work(&state_shared);
 
             // launch thread pool
             for (int j = 0; j < n_threads - 1; j++) {
@@ -9602,17 +9625,11 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 atomic_store(&state_shared.has_work, false);
             }
 
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
+            ggml_spin_lock_has_work(&state_shared);
 
             atomic_fetch_sub(&state_shared.n_ready, 1);
 
-            while (atomic_load(&state_shared.n_ready) != 0) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
+            ggml_spin_lock_n_ready_ne(&state_shared);
         }
 
         // performance stats (node)
