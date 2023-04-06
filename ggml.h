@@ -372,7 +372,8 @@ extern "C" {
 
         char name[32];
 
-        char padding[16];
+        void * cl_tensor;
+        char padding[8];
     };
 
     // computation graph
@@ -401,11 +402,14 @@ extern "C" {
         void * data;
     };
 
+    struct ggml_cl_context;
+
     struct ggml_init_params {
         // memory pool
         size_t mem_size;   // bytes
         void * mem_buffer; // if NULL, memory will be allocated internally
         bool   no_alloc;   // don't allocate memory for the tensor data
+        struct ggml_cl_context * cl_ctx;
     };
 
     // misc
@@ -436,7 +440,8 @@ extern "C" {
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
 
     // main
-
+    GGML_API struct ggml_cl_context * ggml_init_cl(void);
+    GGML_API void ggml_free_cl(struct ggml_cl_context *);
     GGML_API struct ggml_context * ggml_init(struct ggml_init_params params);
     GGML_API void    ggml_free(struct ggml_context * ctx);
 
@@ -475,6 +480,10 @@ extern "C" {
             int64_t ne1,
             int64_t ne2,
             int64_t ne3);
+
+    GGML_API bool ggml_cl_enabled(struct ggml_context * ctx);
+    GGML_API void ggml_tensor_upload_cl(struct ggml_context * ctx, struct ggml_tensor * src);
+    GGML_API void ggml_tensor_download_cl(struct ggml_context * ctx,  struct ggml_tensor * src, struct ggml_tensor * dst);
 
     GGML_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);

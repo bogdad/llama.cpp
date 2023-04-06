@@ -338,6 +338,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.input_suffix = argv[i];
+        } else if (arg == "--opencl") {
+            params.use_opencl = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             gpt_print_usage(argc, argv, default_params);
@@ -473,6 +475,7 @@ struct llama_context * llama_init_from_gpt_params(const gpt_params & params) {
     lparams.use_mlock    = params.use_mlock;
     lparams.logits_all   = params.perplexity;
     lparams.embedding    = params.embedding;
+    lparams.use_opencl = params.use_opencl;
 
     llama_context * lctx = llama_init_from_file(params.model.c_str(), lparams);
 

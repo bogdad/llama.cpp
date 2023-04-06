@@ -145,6 +145,18 @@ if (APPLE AND LLAMA_ACCELERATE)
     endif()
 endif()
 
+if (APPLE)
+    find_library(OPENCL_FRAMEWORK OpenCL)
+    if (OPENCL_FRAMEWORK)
+        message(STATUS "OpenCL framework found")
+
+        add_compile_definitions(GGML_USE_OPENСL)
+        set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${OPENCL_FRAMEWORK})
+    else()
+        message(WARNING "Accelerate framework not found")
+    endif()
+endif()
+
 if (LLAMA_OPENBLAS)
     if (LLAMA_STATIC)
         set(BLA_STATIC ON)

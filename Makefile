@@ -114,6 +114,14 @@ ifndef LLAMA_NO_ACCELERATE
 		LDFLAGS += -framework Accelerate
 	endif
 endif
+ifndef LLAMA_NO_OPENCL
+	# Mac M1 - include OpenCL framework.
+	# `-framework OpenCl` works on Mac Intel as well, with negliable performance boost (as of the predict time).
+	ifeq ($(UNAME_S),Darwin)
+		CFLAGS  += -DGGML_USE_OPENCL
+		LDFLAGS += -framework OpenCL
+	endif
+endif
 ifdef LLAMA_OPENBLAS
 	CFLAGS  += -DGGML_USE_OPENBLAS -I/usr/local/include/openblas -I/usr/include/openblas
 	ifneq ($(shell grep -e "Arch Linux" -e "ID_LIKE=arch" /etc/os-release 2>/dev/null),)

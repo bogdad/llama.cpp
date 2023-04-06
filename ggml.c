@@ -3,11 +3,29 @@
 
 #include "ggml.h"
 
+#include <stdio.h>
+
+
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
 #include <alloca.h>
 #endif
+
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
+#include <CL/cl.h>
+#endif
+#define CL_CHECK(err, name)                                                                     \
+    do {                                                                                        \
+        cl_int err_ = (err);                                                                    \
+        if (err_ != CL_SUCCESS) {                                                               \
+            fprintf(stderr, "OpenCL %s error %d at %s:%d\n", name, err_, __FILE__, __LINE__);   \
+            exit(1);                                                                            \
+        }                                                                                       \
+    } while (0)
 
 #include <assert.h>
 #include <errno.h>
@@ -96,6 +114,17 @@ typedef void* thread_ret_t;
 #endif
 
 /*#define GGML_PERF*/
+
+#define GGML_MLOCK_SUPPORT 0
+
+#ifdef __has_include
+    #if __has_include(<sys/mman.h>)
+        #undef GGML_MLOCK_SUPPORT
+        #define GGML_MLOCK_SUPPORT 1
+        #include <sys/mman.h>
+    #endif
+#endif
+
 #define GGML_DEBUG 0
 #define GGML_GELU_FP16
 #define GGML_SILU_FP16
@@ -3553,6 +3582,16 @@ static_assert(GGML_OP_COUNT == 50, "GGML_OP_COUNT != 50");
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
 
+struct ggml_cl_context {
+    cl_platform_id platform;
+    cl_device_id device;
+    cl_context context;
+    cl_command_queue queue;
+    cl_program program;
+    cl_kernel kernel_f16_f32;
+    cl_kernel kernel_f32;
+    cl_kernel kernel_dup_f32;
+};
 //
 // ggml context
 //
@@ -3570,7 +3609,9 @@ struct ggml_context {
 
     struct ggml_scratch scratch;
     struct ggml_scratch scratch_save;
+    struct ggml_cl_context * cl_ctx;
 };
+
 
 struct ggml_context_container {
     bool used;
@@ -3596,6 +3637,9 @@ struct ggml_compute_params {
     // work buffer for all threads
     size_t wsize;
     void * wdata;
+
+    // this is a hack
+    struct ggml_cl_context * cl_ctx;
 };
 
 //
@@ -3802,6 +3846,123 @@ static inline int ggml_up(int n, int m) {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+cl_program ggml_cl_compile_program(
+    cl_context context, cl_device_id device, const char * program_name) {
+    cl_program program;
+    cl_int err;
+    char * compiler_options = "";
+
+    FILE * cl_source;
+    long cl_source_length;
+    char * cl_source_buffer;
+    const char * cl_source_view;
+    char *program_log;
+    size_t log_size;
+
+    cl_source = fopen(program_name, "r");
+    fseek(cl_source, 0, SEEK_END);
+    cl_source_length = ftell(cl_source);
+    rewind(cl_source);
+    cl_source_buffer = (char *) malloc(cl_source_length + 1);
+    cl_source_buffer[cl_source_length] = '\0';
+    fread(cl_source_buffer, sizeof(char), cl_source_length, cl_source);
+    fclose(cl_source);
+
+    cl_source_view = cl_source_buffer;
+
+    program = clCreateProgramWithSource(context, 1, (const char**)&cl_source_view, NULL, &err);
+    if (err != CL_SUCCESS) {
+        free(cl_source_buffer);
+        printf("Error clCreateProgramWithSource\n");
+        abort();
+    }
+    free(cl_source_buffer);
+    err = clBuildProgram(program, 0, NULL, compiler_options, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+        program_log = (char*) malloc(log_size + 1);
+        program_log[log_size] = '\0';
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size + 1, program_log, NULL);
+        printf("%s\n", program_log);
+        free(program_log);
+        exit(1);
+    }
+
+    // Check for compilation errors
+    size_t logSize;
+    err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logSize);
+    CL_CHECK(err, "Error clGetProgramBuildInfo 2");
+
+    char* messages = (char*)malloc((1+logSize)*sizeof(char));
+    err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logSize, messages, NULL);
+    CL_CHECK(err, "Error clGetProgramBuildInfo 2");
+
+    messages[logSize] = '\0';
+    printf("## Compiler message: %s\n", messages);
+    free(messages);
+    return program;
+}
+
+struct ggml_cl_context * ggml_init_cl() {
+    cl_int err;
+    cl_platform_id platform;
+    cl_device_id device;
+    cl_context_properties context_props[3] = {CL_CONTEXT_PLATFORM, 0, 0};
+    cl_context context;
+    cl_bitfield props = CL_QUEUE_PROFILING_ENABLE | 0;
+    cl_command_queue queue;
+    cl_program program;
+    cl_kernel kernel_f16_f32;
+    cl_kernel kernel_f32;
+    cl_kernel kernel_dup_f32;
+
+    err = clGetPlatformIDs(1, &platform, NULL);
+    CL_CHECK(err, "Error clGetPlatformIDs");
+
+    err = clGetDeviceIDs(NULL, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
+    CL_CHECK(err, "Error clGetDeviceIDs");
+
+    context_props[1] = (cl_context_properties)platform;
+    context = clCreateContext(context_props, 1, &device, NULL, NULL, &err);
+    CL_CHECK(err, "Error clCreateContext");
+
+    queue = clCreateCommandQueue(context, device, props, &err);
+    CL_CHECK(err, "Error clCreateCommandQueue");
+
+    program = ggml_cl_compile_program(context, device, "ggml.cl");
+
+    kernel_f16_f32 = clCreateKernel(program, "matmul4D_f16_f32", &err);
+    CL_CHECK(err, "Error creating kernel");
+    kernel_f32 = clCreateKernel(program, "matmul4D_f32", &err);
+    CL_CHECK(err, "Error creating kernel");
+    kernel_dup_f32 = clCreateKernel(program, "dup_f32", &err);
+    CL_CHECK(err, "Error creating kernel");
+
+    struct ggml_cl_context * cl_ctx = (struct ggml_cl_context *) malloc(sizeof(struct ggml_cl_context));
+    *cl_ctx = (struct ggml_cl_context) {
+        /*.platform           =*/ platform,
+        /*.device             =*/ device,
+        /*.context            =*/ context,
+        /*.queue              =*/ queue,
+        /*.program            =*/ program,
+        /*.kernel_f16_f32     =*/ kernel_f16_f32,
+        /*.kernel_f32         =*/ kernel_f32,
+        /*.kernel_dup_f32     =*/ kernel_dup_f32,
+    };
+    return cl_ctx;
+}
+
+void ggml_free_cl(struct ggml_cl_context * ctx) {
+    if (!ctx)
+        return;
+    clReleaseCommandQueue(ctx->queue);
+    clReleaseContext(ctx->context);
+    clReleaseProgram(ctx->program);
+    clReleaseKernel(ctx->kernel_f16_f32);
+    clReleaseKernel(ctx->kernel_f32);
+    clReleaseKernel(ctx->kernel_dup_f32);
+}
+
 struct ggml_context * ggml_init(struct ggml_init_params params) {
     // make this function thread safe
     ggml_critical_section_start();
@@ -3877,7 +4038,6 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 
         return NULL;
     }
-
     const size_t mem_size = (params.mem_size + GGML_MEM_ALIGN - 1) & ~(GGML_MEM_ALIGN - 1);
 
     *ctx = (struct ggml_context) {
@@ -3890,6 +4050,7 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         /*.objects_end        =*/ NULL,
         /*.scratch            =*/ { 0, 0, NULL, },
         /*.scratch_save       =*/ { 0, 0, NULL, },
+        /*.cl_ctx             =*/ params.cl_ctx,
     };
 
     GGML_ASSERT(ctx->mem_buffer != NULL);
@@ -3929,6 +4090,8 @@ void ggml_free(struct ggml_context * ctx) {
         GGML_PRINT_DEBUG("%s: context not found\n", __func__);
     }
 
+    // XXXXXXXXXX free cl buffers for each tensor!!!!!!!!!
+
     ggml_critical_section_end();
 }
 
@@ -3959,13 +4122,66 @@ void ggml_scratch_load(struct ggml_context * ctx) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+#define cl_buffer_unmark(x)  ((x) & ~(uintptr_t)1)
+
+void* ggml_tensor_cl_get_buffer(const struct ggml_tensor * result) {
+    return (void *)
+        ((uintptr_t)result -> cl_tensor & ~(uintptr_t)1);
+}
+void ggml_tensor_cl_set_buffer_uploaded(struct ggml_tensor * result) {
+    result -> cl_tensor = (void *) (uintptr_t)((uintptr_t) (result -> cl_tensor) | (uintptr_t)1);
+}
+void ggml_tensor_cl_clear_buffer_uploaded(struct ggml_tensor * result) {
+    result -> cl_tensor = ggml_tensor_cl_get_buffer(result);
+}
+bool ggml_tensor_cl_is_buffer_uploaded(const struct ggml_tensor * result) {
+    return (bool)((uintptr_t) (result -> cl_tensor) & ((uintptr_t)1));
+}
+
+bool ggml_cl_enabled(struct ggml_context * ctx) {
+    return ctx->cl_ctx != NULL;
+}
+
+void ggml_tensor_upload_cl(
+        struct ggml_context * ctx,
+        struct ggml_tensor * src) {
+    if (ctx->cl_ctx == NULL || src->data == NULL || src->n_dims != 2
+        || !(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16)) {
+        abort();
+    }
+    int cl_src0_size = src->ne[0] * src->ne[1] * GGML_TYPE_SIZE[src->type];
+    cl_int err = clEnqueueWriteBuffer(ctx->cl_ctx->queue, src->cl_tensor,
+                CL_TRUE, 0, cl_src0_size, src->data, 0, NULL, NULL);
+    CL_CHECK(err, "error uploading buffer");
+    clFinish(ctx->cl_ctx->queue);
+    ggml_tensor_cl_set_buffer_uploaded(src);
+}
+
+void ggml_tensor_download_cl(
+        struct ggml_context * ctx,
+        struct ggml_tensor * src,
+        struct ggml_tensor * dst) {
+    cl_int err;
+    if (ctx->cl_ctx == NULL || dst->data == NULL || dst->n_dims != 2
+        || !(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
+        abort();
+    }
+    int cl_size = dst->ne[0] * dst->ne[1] * GGML_TYPE_SIZE[dst->type];
+    cl_mem dstbuffer = ggml_tensor_cl_get_buffer(src);
+    err = clEnqueueReadBuffer(ctx->cl_ctx->queue, dstbuffer, CL_TRUE, 0, cl_size, dst->data, 0, NULL, NULL);
+    CL_CHECK(err, "Error reading result buffer");
+
+    // Wait for kernel to finish
+    clFinish(ctx->cl_ctx->queue);
+}
 
 struct ggml_tensor * ggml_new_tensor_impl(
         struct ggml_context * ctx,
         enum   ggml_type type,
         int    n_dims,
         const int64_t* ne,
-        void*  data) {
+        void*  data,
+        const struct ggml_tensor * src) {
     // always insert objects at the end of the context's memory pool
     struct ggml_object * obj_cur = ctx->objects_end;
 
@@ -4062,7 +4278,8 @@ struct ggml_tensor * ggml_new_tensor_impl(
         /*.perf_time_us =*/ 0,
         /*.data         =*/ (data == NULL && !ctx->no_alloc) ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
-        /*.pad          =*/ { 0 },
+        /*.cl_tensor    =*/ src!=NULL ? src->cl_tensor: NULL,
+        /*.pad        =*/ { 0 },
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
@@ -4080,6 +4297,29 @@ struct ggml_tensor * ggml_new_tensor_impl(
 
     ctx->n_objects++;
 
+    if (data != NULL && n_dims == 2
+        && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16)) {
+        // upload to opencl
+        if (ctx->cl_ctx != NULL && (!src || (src && src->cl_tensor == NULL))) {
+            cl_int err;
+            int cl_src0_size = ne[0] * ne[1] * GGML_TYPE_SIZE[type];
+            result->cl_tensor = clCreateBuffer(ctx->cl_ctx->context, CL_MEM_READ_WRITE, cl_src0_size, NULL, &err);
+            CL_CHECK(err, "error creating buffer");
+            //printf("xxxxxx uploading tensor from existing data\n");
+            ggml_tensor_upload_cl(ctx, result);
+        }
+    } else if (data == NULL && n_dims == 2
+        && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16)) {
+        // create possible target buffer
+        if (ctx->cl_ctx != NULL) {
+            cl_int err;
+            int cl_src0_size = ne[0] * ne[1] * GGML_TYPE_SIZE[type];
+            result->cl_tensor = clCreateBuffer(ctx->cl_ctx->context, CL_MEM_READ_WRITE, cl_src0_size, NULL, &err);
+            CL_CHECK(err, "error creating target buffer");
+            //printf("ssssssssssss %p (%d, %d) = %d\n", result->cl_tensor, (int)ne[0], (int)ne[1], cl_src0_size);
+        }
+    }
+
     return result;
 }
 
@@ -4088,7 +4328,7 @@ struct ggml_tensor * ggml_new_tensor(
         enum   ggml_type type,
         int    n_dims,
         const int64_t * ne) {
-    return ggml_new_tensor_impl(ctx, type, n_dims, ne, NULL);
+    return ggml_new_tensor_impl(ctx, type, n_dims, ne, NULL, NULL);
 }
 
 struct ggml_tensor * ggml_new_tensor_1d(
@@ -4153,7 +4393,7 @@ struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value) {
 }
 
 struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggml_tensor * src) {
-    return ggml_new_tensor_impl(ctx, src->type, src->n_dims, src->ne, NULL);
+    return ggml_new_tensor_impl(ctx, src->type, src->n_dims, src->ne, NULL, NULL);
 }
 
 struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor) {
@@ -4426,7 +4666,7 @@ void ggml_set_name(struct ggml_tensor * tensor, const char * name) {
 struct ggml_tensor * ggml_view_tensor(
         struct ggml_context * ctx,
         const struct ggml_tensor * src) {
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, src->type, src->n_dims, src->ne, src->data);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, src->type, src->n_dims, src->ne, src->data, src);
 
     result->nb[0] = src->nb[0];
     result->nb[1] = src->nb[1];
@@ -5557,7 +5797,7 @@ struct ggml_tensor * ggml_reshape(
         //GGML_ASSERT(false);
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, b->n_dims, b->ne, a->data);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, b->n_dims, b->ne, a->data, a);
 
     result->op   = GGML_OP_RESHAPE;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -5581,7 +5821,7 @@ struct ggml_tensor * ggml_reshape_1d(
     }
 
     const int64_t ne[1] = { ne0 };
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 1, ne, a->data);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 1, ne, a->data, a);
 
     result->op   = GGML_OP_RESHAPE;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -5606,7 +5846,7 @@ struct ggml_tensor * ggml_reshape_2d(
     }
 
     const int64_t ne[2] = { ne0, ne1 };
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 2, ne, a->data);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 2, ne, a->data, a);
 
     result->op   = GGML_OP_RESHAPE;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -5632,7 +5872,7 @@ struct ggml_tensor * ggml_reshape_3d(
     }
 
     const int64_t ne[3] = { ne0, ne1, ne2 };
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 3, ne, a->data);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 3, ne, a->data, a);
 
     result->op   = GGML_OP_RESHAPE;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -5660,7 +5900,7 @@ struct ggml_tensor * ggml_reshape_4d(
     }
 
     const int64_t ne[4] = { ne0, ne1, ne2, ne3 };
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 4, ne, a->data);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 4, ne, a->data, a);
 
     result->op   = GGML_OP_RESHAPE;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -5684,7 +5924,7 @@ struct ggml_tensor * ggml_view_1d(
         is_node = true;
     }
 
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 1, &ne0, (char *) a->data + offset);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 1, &ne0, (char *) a->data + offset, NULL);
 
     result->op   = GGML_OP_VIEW;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -5716,7 +5956,7 @@ struct ggml_tensor * ggml_view_2d(
 
     const int64_t ne[GGML_MAX_DIMS] = { ne0, ne1, 1, 1 };
 
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 2, ne, (char *) a->data + offset);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 2, ne, (char *) a->data + offset, NULL);
 
     result->nb[1] = nb1;
     result->nb[2] = result->nb[1]*ne1;
@@ -5754,7 +5994,7 @@ struct ggml_tensor * ggml_view_3d(
 
     const int64_t ne[GGML_MAX_DIMS] = { ne0, ne1, ne2, 1 };
 
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 3, ne, (char *) a->data + offset);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 3, ne, (char *) a->data + offset, NULL);
 
     result->nb[1] = nb1;
     result->nb[2] = nb2;
@@ -5794,7 +6034,7 @@ struct ggml_tensor * ggml_view_4d(
 
     const int64_t ne[GGML_MAX_DIMS] = { ne0, ne1, ne2, ne3 };
 
-    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 4, ne, (char *) a->data + offset);
+    struct ggml_tensor * result = ggml_new_tensor_impl(ctx, a->type, 4, ne, (char *) a->data + offset, NULL);
 
     result->nb[1] = nb1;
     result->nb[2] = nb2;
@@ -6776,11 +7016,71 @@ static void ggml_compute_forward_dup_f16(
     }
 }
 
+static cl_int ggml_compute_forward_dup_f32_cl(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        struct ggml_tensor * dst) {
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return CL_SUCCESS;
+    }
+    if (!ggml_tensor_cl_is_buffer_uploaded(src0)) {
+        printf("xxxx not uploaded 0 %.32s\n", src0->name);
+        abort();
+    }
+
+    // printf("zzzzzzzzzzzzzzzz %f\n", ((float*)src0->data)[0]);
+
+    int ne00 = src0->ne[0];
+    int ne01 = src0->ne[1];
+    int nb00 = src0->nb[0];
+    int nb01 = src0->nb[1];
+    int nb0 = dst->nb[0];
+    int nb1 = dst->nb[1];
+    cl_kernel kernel = params->cl_ctx->kernel_dup_f32;
+    cl_int err;
+    cl_mem src0buffer = ggml_tensor_cl_get_buffer(src0);
+    cl_mem dstbuffer = ggml_tensor_cl_get_buffer(dst);
+    err = clSetKernelArg(kernel, 0, sizeof(cl_int), &nb00);
+    CL_CHECK(err, "Error setting kernel arguments 0");
+    err = clSetKernelArg(kernel, 1, sizeof(cl_int), &nb01);
+    CL_CHECK(err, "Error setting kernel arguments 1");
+    err = clSetKernelArg(kernel, 2, sizeof(cl_int), &nb0);
+    CL_CHECK(err, "Error setting kernel arguments 2");
+    err = clSetKernelArg(kernel, 3, sizeof(cl_int), &nb1);
+    CL_CHECK(err, "Error setting kernel arguments 3");
+    err = clSetKernelArg(kernel, 4, sizeof(cl_mem), &src0buffer);
+    CL_CHECK(err, "Error setting kernel arguments 4");
+    err = clSetKernelArg(kernel, 5, sizeof(cl_mem), &dstbuffer);
+    CL_CHECK(err, "Error setting kernel arguments 5");
+
+    size_t global_size[2] = {(size_t)ne00, (size_t)ne01};
+    size_t local_size[2] = {16, 16};
+
+    err = clEnqueueNDRangeKernel(params->cl_ctx->queue, kernel, 2, NULL, global_size, local_size, 0, NULL, NULL);
+    CL_CHECK(err, "Error clEnqueueNDRangeKernel");
+
+    err = clEnqueueReadBuffer(params->cl_ctx->queue, dstbuffer, CL_TRUE, 0, dst->ne[0] * dst->ne[1] * sizeof(cl_float), dst->data, 0, NULL, NULL);
+    CL_CHECK(err, "Error reading result buffer");
+
+    clFinish(params->cl_ctx->queue);
+    ggml_tensor_cl_set_buffer_uploaded(dst);
+
+    // printf("zzzzzzzzzzzzzzzz %f\n", ((float*)dst->data)[0]);
+
+    return CL_SUCCESS;
+}
+
 static void ggml_compute_forward_dup_f32(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
         struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
+
+    if (params->cl_ctx) {
+        ggml_compute_forward_dup_f32_cl(params, src0, dst);
+        return;
+    }
 
     if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
         return;
@@ -8823,7 +9123,6 @@ static void ggml_compute_forward_gelu(
             } break;
     }
 
-    //printf("XXXXXXXX gelu\n");
 }
 
 // ggml_compute_forward_silu
@@ -9323,6 +9622,107 @@ static bool ggml_compute_forward_mul_mat_use_blas(
 }
 #endif
 
+static bool ggml_compute_forward_dup_use_opencl(
+        const struct ggml_tensor * src0) {
+    if ((src0->type == GGML_TYPE_F32) && src0->ne[2] == 1 && src0->ne[3] == 1) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool ggml_compute_forward_mul_mat_use_opencl(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1) {
+    if ((src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) && src1->type == GGML_TYPE_F32 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
+        return true;
+    }
+
+    return false;
+}
+
+
+static cl_int ggml_compute_forward_mul_mat_float_cl(const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+              struct ggml_tensor * dst) {
+
+    assert(src0->n_dims == 2 && src1->n_dims == 2);
+    assert(src0->ne[2] == 1 && src0->ne[3] == 1);
+    assert(src1->ne[2] == 1 && src1->ne[3] == 1);
+
+
+    cl_int err;
+
+    cl_kernel kernel;
+
+    if (src0->type == GGML_TYPE_F16) {
+        kernel = params->cl_ctx->kernel_f16_f32;
+    } else {
+        kernel = params->cl_ctx->kernel_f32;
+    }
+    /* printf("xxxxx [%p,%lld, %lld,%lld] [%p,%lld, %lld,%lld] [%p,%lld, %lld,%lld]\n",
+        src0->cl_tensor, src0->perf_time_us, s0e0, s0e1,
+        src1->cl_tensor, src1->perf_time_us, s1e0, s1e1,
+        dst->cl_tensor, dst->perf_time_us, de0, de1);*/
+    if (!params->cl_ctx->context) {
+        printf("xxxxxx null ctx\n");
+    }
+    if (!src0->cl_tensor) {
+        printf("!src0->cl_tensor\n");
+    }
+
+    if (!ggml_tensor_cl_is_buffer_uploaded(src0)) {
+        printf("xxxx not uploaded 0 %.32s\n", src0->name);
+        abort();
+    }
+    if (!ggml_tensor_cl_is_buffer_uploaded(src1)) {
+        printf("xxxx not uploaded 1 %.32s\n", src1->name);
+        abort();
+    }
+
+    cl_mem src0buffer = ggml_tensor_cl_get_buffer(src0);
+    cl_mem src1buffer = ggml_tensor_cl_get_buffer(src1);
+    cl_mem dstbuffer = ggml_tensor_cl_get_buffer(dst);
+
+    err = clSetKernelArg(kernel, 0, sizeof(cl_int), &dst->ne[0]);
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_int), &dst->ne[1]);
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_int), &src0->ne[0]);
+    CL_CHECK(err, "Error setting kernel arguments 1");
+
+    err |= clSetKernelArg(kernel, 3, sizeof(cl_mem), &src0buffer);
+    CL_CHECK(err, "Error setting kernel arguments 2");
+
+    err |= clSetKernelArg(kernel, 4, sizeof(cl_mem), &src1buffer);
+    CL_CHECK(err, "Error setting kernel arguments 3");
+
+    err |= clSetKernelArg(kernel, 5, sizeof(cl_mem), &dstbuffer);
+    CL_CHECK(err, "Error setting kernel arguments 4");
+
+    // Define the global and local work sizes
+    size_t global_size[2] = {(size_t)dst->ne[0], (size_t)dst->ne[1]};
+    size_t local_size[2] = {16, 16};
+
+    // Execute the kernel
+    //printf("ssss %p %p\n", (void*)src0buffer, (void*)src1buffer);
+
+    err = clEnqueueNDRangeKernel(params->cl_ctx->queue, kernel, 2, NULL, global_size, local_size, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        printf("xxxx Error executing kernel %d global_size [%zu, %zu]\n", err, global_size[0], global_size[1]);
+        abort();
+    }
+
+    // Read the result from the output buffer
+    err = clEnqueueReadBuffer(params->cl_ctx->queue, dstbuffer, CL_TRUE, 0, dst->ne[0] * dst->ne[1] * sizeof(cl_float), dst->data, 0, NULL, NULL);
+    CL_CHECK(err, "Error reading result buffer");
+
+    // Wait for kernel to finish
+    clFinish(params->cl_ctx->queue);
+    ggml_tensor_cl_set_buffer_uploaded(dst);
+    return CL_SUCCESS;
+}
+
+
 static void ggml_compute_forward_mul_mat_f32(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
@@ -9418,6 +9818,8 @@ static void ggml_compute_forward_mul_mat_f32(
 
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
+                // 0 (cont)
+                //
                 const float * x = (float *) ((char *) src0->data + i02*nb02 + i03*nb03);
                 const float * y = (float *) ((char *) src1->data + i02*nb12 + i03*nb13);
                 float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
@@ -9432,10 +9834,12 @@ static void ggml_compute_forward_mul_mat_f32(
                         GGML_TYPE_F32);
 #else
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                        ne11, ne01, ne10,
-                        1.0f,    y, ne10,
-                                 x, ne00,
-                        0.0f,    d, ne01);
+                        // (M, K) x (K, N) = (M, N)
+                        // m     n     k
+                        ne11, ne01, ne10,  // why y and x have equal ne10?
+                        1.0f,    y, ne10,  // pos of (i02, i03) in src1, k
+                                 x, ne00,  // pos of (i02, i03) in src0, k
+                        0.0f,    d, ne01); // pos of (i02, i03) in dst, n
 #endif
             }
         }
@@ -9950,11 +10354,27 @@ static void ggml_compute_forward_mul_mat(
             } break;
         case GGML_TYPE_F16:
             {
-                ggml_compute_forward_mul_mat_f16_f32(params, src0, src1, dst);
+                if (params->cl_ctx != NULL && src1->type == GGML_TYPE_F32
+                    && ggml_compute_forward_mul_mat_use_opencl(src0, src1)) {
+                    int cl_res = ggml_compute_forward_mul_mat_float_cl(params, src0, src1, dst);
+                    if (cl_res != CL_SUCCESS) {
+                        abort();
+                    }
+                } else {
+                    ggml_compute_forward_mul_mat_f16_f32(params, src0, src1, dst);
+                }
             } break;
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_mul_mat_f32(params, src0, src1, dst);
+                if (params->cl_ctx != NULL && src1->type == GGML_TYPE_F32
+                    && ggml_compute_forward_mul_mat_use_opencl(src0, src1)) {
+                    int cl_res = ggml_compute_forward_mul_mat_float_cl(params, src0, src1, dst);
+                    if (cl_res != CL_SUCCESS) {
+                        abort();
+                    }
+                } else {
+                    ggml_compute_forward_mul_mat_f32(params, src0, src1, dst);
+                }
             } break;
         default:
             {
@@ -13843,6 +14263,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     .nth   = n_threads,
                     .wsize = cgraph->work ? ggml_nbytes(cgraph->work) : 0,
                     .wdata = cgraph->work ? cgraph->work->data : NULL,
+                    .cl_ctx = ctx->cl_ctx,
                 },
                 .node   = NULL,
                 .shared = &state_shared,
@@ -13866,14 +14287,20 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 case GGML_OP_CPY:
                 case GGML_OP_DUP:
                     {
+                        if (ctx->cl_ctx != NULL && ggml_compute_forward_dup_use_opencl(node->src0)) {
+                            node->n_tasks = 1;
+                            goto skipworkdup;
+                        }
                         node->n_tasks = n_threads;
 
                         size_t cur = 0;
                         if (ggml_is_quantized(node->type)) {
                             cur = GGML_TYPE_SIZE[GGML_TYPE_F32] * node->ne[0] * n_threads;
                         }
-
                         work_size = MAX(work_size, cur);
+                        skipworkdup:
+                        if (work_size < 0)
+                            abort();
                     } break;
                 case GGML_OP_ADD:
                 case GGML_OP_ADD1:
@@ -13929,6 +14356,10 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
+                        if (ctx->cl_ctx != NULL && ggml_compute_forward_mul_mat_use_opencl(node->src0, node->src1)) {
+                            node->n_tasks = 1;
+                            goto skipwork;
+                        }
                         node->n_tasks = n_threads;
 
                         // TODO: use different scheduling for different matrix sizes
@@ -13982,8 +14413,10 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                         } else {
                             GGML_ASSERT(false);
                         }
-
                         work_size = MAX(work_size, cur);
+                        skipwork:
+                        if (work_size < 0)
+                            abort();
                     } break;
                 case GGML_OP_SCALE:
                     {
@@ -14132,6 +14565,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
             /*.nth   =*/ node->n_tasks,
             /*.wsize =*/ cgraph->work ? ggml_nbytes(cgraph->work) : 0,
             /*.wdata =*/ cgraph->work ? cgraph->work->data : NULL,
+            /*.cl_ctx=*/ ctx->cl_ctx,
         };
 
         ggml_compute_forward(&params, node);
@@ -14155,6 +14589,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     .nth   = node->n_tasks,
                     .wsize = cgraph->work ? ggml_nbytes(cgraph->work) : 0,
                     .wdata = cgraph->work ? cgraph->work->data : NULL,
+                    .cl_ctx = ctx->cl_ctx,
                 };
                 workers[j].node = node;
             }
@@ -14210,6 +14645,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     .nth   = node->n_tasks,
                     .wsize = cgraph->work ? ggml_nbytes(cgraph->work) : 0,
                     .wdata = cgraph->work ? cgraph->work->data : NULL,
+                    .cl_ctx = ctx->cl_ctx,
                 };
                 workers[j].node = node;
             }
@@ -15128,6 +15564,7 @@ enum ggml_opt_result ggml_opt(
             .mem_size   = 16*1024*1024,
             .mem_buffer = NULL,
             .no_alloc   = false,
+            .cl_ctx     = NULL,
         };
 
         ctx = ggml_init(params_ctx);

@@ -6,6 +6,7 @@ function(llama_add_test source)
 endfunction()
 
 # llama_add_test(test-double-float.c) # SLOW
+llama_add_test(test-mul-mat.cpp)
 llama_add_test(test-quantize-fns.cpp)
 llama_add_test(test-quantize-perf.cpp)
 llama_add_test(test-sampling.cpp)

@@ -69,6 +69,8 @@ extern "C" {
         llama_progress_callback progress_callback;
         // context pointer passed to the progress callback
         void * progress_callback_user_data;
+
+        bool use_opencl;
     };
 
     // model file types

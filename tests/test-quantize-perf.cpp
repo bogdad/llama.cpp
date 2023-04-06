@@ -215,6 +215,7 @@ int main(int argc, char * argv[]) {
         /* .mem_size   = */ 1*1024,
         /* .mem_buffer = */ NULL,
         /* .no_alloc   = */ true,
+        /* .cl_ctx     = */ NULL,
     };
     struct ggml_context * ctx = ggml_init(ggml_params);
 

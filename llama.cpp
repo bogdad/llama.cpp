@@ -237,6 +237,8 @@ struct llama_context {
     int    buf_last = 0;
     size_t buf_max_size[LLAMA_MAX_SCRATCH_BUFFERS] = { 0 };
 
+    ggml_cl_context * cl_ctx;
+
     void use_buf(struct ggml_context * ctx, int i) {
 #if defined(LLAMA_USE_SCRATCH)
         size_t last_size = 0;
@@ -703,6 +705,9 @@ struct llama_model_loader {
             lt.data = (uint8_t *) lt.ggml_tensor->data;
             load_data_for(lt);
             lt.ggml_tensor->data = lt.data;
+            if (ggml_cl_enabled(ggml_ctx)) {
+                ggml_tensor_upload_cl(ggml_ctx, lt.ggml_tensor);
+            }
             done_size += lt.size;
             if (use_mmap && lmlock) {
                 lmlock->grow_to(done_size);
@@ -777,6 +782,7 @@ struct llama_model_loader {
 //
 
 static bool kv_cache_init(
+        const struct llama_context & ctx,
         const struct llama_hparams & hparams,
              struct llama_kv_cache & cache,
                          ggml_type   wtype,
@@ -793,6 +799,7 @@ static bool kv_cache_init(
     params.mem_size   = cache.buf.size;
     params.mem_buffer = cache.buf.addr;
     params.no_alloc   = false;
+    params.cl_ctx     = ctx.cl_ctx;
 
     cache.ctx = ggml_init(params);
 
@@ -822,6 +829,7 @@ struct llama_context_params llama_context_default_params() {
         /*.embedding                   =*/ false,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
+        /*.use_opencl                  =*/ false,
     };
 
     return result;
@@ -965,6 +973,7 @@ static void llama_model_load_internal(
 
     // create the ggml context
     {
+
         lctx.model.buf.resize(ctx_size);
         if (use_mlock) {
             lctx.model.mlock_buf.init(lctx.model.buf.addr);
@@ -975,6 +984,7 @@ static void llama_model_load_internal(
             /*.mem_size   =*/ lctx.model.buf.size,
             /*.mem_buffer =*/ lctx.model.buf.addr,
             /*.no_alloc   =*/ ml->use_mmap,
+            /*.cl_ctx     =*/ lctx.cl_ctx,
         };
 
         model.ctx = ggml_init(params);
@@ -1127,6 +1137,7 @@ static bool llama_eval_internal(
         /*.mem_size   =*/ buf_compute.size,
         /*.mem_buffer =*/ buf_compute.addr,
         /*.no_alloc   =*/ false,
+        /*.cl_ctx     =*/ lctx.cl_ctx,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -1139,6 +1150,7 @@ static bool llama_eval_internal(
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     ggml_set_name(embd, "embd");
     memcpy(embd->data, tokens, N*ggml_element_size(embd));
+    ggml_tensor_upload_cl(ctx0, embd);
 
     struct ggml_tensor * inpL = ggml_get_rows(ctx0, model.tok_embeddings, embd);
 
@@ -2123,6 +2135,8 @@ struct llama_context * llama_init_from_file(
         params.seed = time(NULL);
     }
 
+    ctx->cl_ctx = params.use_opencl ? ggml_init_cl(): NULL;
+
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
         params.progress_callback_user_data = &cur_percentage;
@@ -2155,7 +2169,7 @@ struct llama_context * llama_init_from_file(
 
     // reserve memory for context buffers
     if (!params.vocab_only) {
-        if (!kv_cache_init(ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx)) {
+        if (!kv_cache_init(*ctx, ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx)) {
             fprintf(stderr, "%s: kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
@@ -2189,6 +2203,7 @@ struct llama_context * llama_init_from_file(
 }
 
 void llama_free(struct llama_context * ctx) {
+    ggml_free_cl(ctx->cl_ctx);
     delete ctx;
 }
 
@@ -2569,7 +2584,7 @@ size_t llama_copy_state_data(struct llama_context * ctx, uint8_t * dst) {
 
             char buffer[4096];
 
-            ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true });
+            ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true, /* cl_ctx */ nullptr});
             ggml_cgraph gf{};
             gf.n_threads = 1;
 
@@ -2677,7 +2692,7 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
 
             char buffer[4096];
 
-            ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true });
+            ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true, /* cl_ctx */ nullptr});
             ggml_cgraph gf{};
             gf.n_threads = 1;
 
